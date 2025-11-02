@@ -1,0 +1,6 @@
+numpy==1.26.4
+onnx==1.16.2
+onnxruntime==1.18.0
+scipy==1.14.1
+tf2onnx==1.16.1
+tensorflow==2.19.0
