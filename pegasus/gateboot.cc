@@ -81,6 +81,8 @@ void LWEGateBooter::SetPostMultiplier(const double multiplier) {
             [](double e) { return std::signbit(e) ? 0.0 : e; });
     InitLUT(LUTs["DReLU"], degree,
             [](double e) { return std::signbit(e) ? 0.0 : 1.0; });
+    InitLUT(LUTs["DSigmoid"], degree,
+            [](double e) { double s = 1. / (1. + std::exp(-e)); return s * (1. - s); });
     InitLUT(LUTs["Identity"], degree, [](double e) { return e; });
     InitLUT(LUTs["Clip"], degree, [](double e) {
       return std::abs(e) < 5.0 ? e : (e < 0 ? -5.0 : 5.0);
@@ -196,6 +198,7 @@ LWEGATEBOOT_FUNC(Inverse, "Inverse")
 LWEGATEBOOT_FUNC(LeakyReLU, "LeakyReLU")
 LWEGATEBOOT_FUNC(ReLU, "ReLU")
 LWEGATEBOOT_FUNC(DReLU, "DReLU")
+LWEGATEBOOT_FUNC(DSigmoid, "DSigmoid")
 LWEGATEBOOT_FUNC(Identity, "Identity")
 LWEGATEBOOT_FUNC(Clip, "Clip")
 LWEGATEBOOT_FUNC(Exponent, "Exponent")

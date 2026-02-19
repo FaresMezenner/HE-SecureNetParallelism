@@ -42,6 +42,8 @@ class LWEGateBooter {
 
   void DReLU(RLWE2LWECt_t lwe_N, const lwe::Ctx_t lwe_n) const;
 
+  void DSigmoid(RLWE2LWECt_t lwe_N, const lwe::Ctx_t lwe_n) const;
+
   void Identity(RLWE2LWECt_t lwe_N, const lwe::Ctx_t lwe_n) const;
 
   void Clip(RLWE2LWECt_t lwe_N, const lwe::Ctx_t lwe_n) const;
