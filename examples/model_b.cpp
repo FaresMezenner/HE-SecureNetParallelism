@@ -11,24 +11,25 @@ using namespace seal;
 using namespace std;
 
 int num_threads = 64;
-extern double total_save_model_time;
-extern double total_load_model_time;
-extern double total_offline_time;
-extern double total_online_time;
-extern bool not_first_epoch;
+extern thread_local double total_save_model_time;
+extern thread_local double total_load_model_time;
+extern thread_local double total_offline_time;
+extern thread_local double total_online_time;
+extern thread_local bool not_first_epoch;
 extern std::string save_model_loc;
 extern std::string model_name;
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
     // Pegasus setup
     PegasusRunTime::Parms pp;
 
     pp.lvl0_lattice_dim = lwe::params::n(); // 1024
-    pp.lvl1_lattice_dim = 1 << 12; // 4096
-    pp.lvl2_lattice_dim = 1 << 16; // 65536
-    pp.nlevels = 8; // CKKS levels
+    pp.lvl1_lattice_dim = 1 << 12;          // 4096
+    pp.lvl2_lattice_dim = 1 << 16;          // 65536
+    pp.nlevels = 8;                         // CKKS levels
     pp.scale = std::pow(2., 40);
-    pp.nslots = 128; // The number of batch size 
+    pp.nslots = 128; // The number of batch size
     pp.s2c_multiplier = 1.;
     pp.enable_repacking = true;
 
@@ -36,9 +37,9 @@ int main(int argc, char *argv[]) {
     omp_set_num_threads(num_threads);
 
     int batch_start_point = 0; // The starting index of the training samples
-    int nslots = pp.nslots; // The number of slots in a ciphertext is equal to the batch size
-    int total_epoches = 10; // The total number of iterations for model training 
-    not_first_epoch = false; // A flag to determine whether it's in the first epoch or not
+    int nslots = pp.nslots;    // The number of slots in a ciphertext is equal to the batch size
+    int total_epoches = 10;    // The total number of iterations for model training
+    not_first_epoch = false;   // A flag to determine whether it's in the first epoch or not
 
     // Read MNIST dataset
     mnist::MNIST_dataset<vector, vector<uint8_t>, uint8_t> dataset =
@@ -86,73 +87,87 @@ int main(int argc, char *argv[]) {
 
     // Init model weight and bias
     // Random number generator
-    std::random_device rd; // Non-deterministic random seed
+    std::random_device rd;  // Non-deterministic random seed
     std::mt19937 gen(rd()); // Mersenne twister engine seeded with random device
     std::uniform_real_distribution<double> dis(-0.3, 0.3);
 
     // W1
-    for(int i = 0; i < l0; i++){
-        for(int j = 0; j < l1; j++){
+    for (int i = 0; i < l0; i++)
+    {
+        for (int j = 0; j < l1; j++)
+        {
             W1[i][j] = dis(gen);
         }
     }
 
     // B1
-    for(int i = 0; i < l1; i++){
+    for (int i = 0; i < l1; i++)
+    {
         B1[i] = dis(gen);
     }
 
     // W2
-    for(int i = 0; i < l1; i++){
-        for(int j = 0; j < l2; j++){
+    for (int i = 0; i < l1; i++)
+    {
+        for (int j = 0; j < l2; j++)
+        {
             W2[i][j] = dis(gen);
         }
     }
 
     // B2
-    for(int i = 0; i < l2; i++){
+    for (int i = 0; i < l2; i++)
+    {
         B2[i] = dis(gen);
     }
 
     // W3
-    for(int i = 0; i < l2; i++){
-        for(int j = 0; j < l3; j++){
+    for (int i = 0; i < l2; i++)
+    {
+        for (int j = 0; j < l3; j++)
+        {
             W3[i][j] = dis(gen);
         }
     }
 
     // B3
-    for(int i = 0; i < l3; i++){
+    for (int i = 0; i < l3; i++)
+    {
         B3[i] = dis(gen);
     }
 
     // The Training Loop
-    for(int epoch = 0; epoch < total_epoches; epoch++){
+    for (int epoch = 0; epoch < total_epoches; epoch++)
+    {
         std::cout << "=========" << std::endl;
         std::cout << "EPOCH " << epoch << std::endl;
         std::cout << "=========" << std::endl;
 
-        if(epoch != 0) not_first_epoch = true;
+        if (epoch != 0)
+            not_first_epoch = true;
         batch_start_point = nslots * epoch;
 
         std::cout << "Read the input data" << std::endl;
-        for(int i = 0; i < l0; i++){
-            for(int j = 0; j < nslots; j++){
+        for (int i = 0; i < l0; i++)
+        {
+            for (int j = 0; j < nslots; j++)
+            {
                 D0[i][j] = int(dataset.test_images[batch_start_point + j][i]) / 255.0;
             }
             pg_rt.EncodeThenEncrypt(D0[i], D0_cipher[i]);
         }
 
         std::cout << "Read the input labels" << std::endl;
-        for(int i = 0; i < nslots; i++){
+        for (int i = 0; i < nslots; i++)
+        {
             Y[int(dataset.test_labels[batch_start_point + i])][i] = 1.0;
         }
-        for(int i = 0; i < l3; i++){
+        for (int i = 0; i < l3; i++)
+        {
             pg_rt.EncodeThenEncrypt(Y[i], Y_cipher[i]);
         }
         pg_rt.s2c_and_extract(Y_cipher, U_lwe_cipher, l3, nslots);
         pg_rt.repack(U_lwe_cipher, Y_cipher, l3, nslots);
-
 
         std::cout << "===========================" << std::endl;
         std::cout << "Layer 1 FORWARD PROPAGATION" << std::endl;

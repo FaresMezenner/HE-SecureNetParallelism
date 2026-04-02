@@ -79,7 +79,7 @@ using namespace gemini;
 
 // ── Tuneable constants ──────────────────────────────────────────────
 static constexpr int NUM_THREADS = 8; // FULL machine per module (theoretical)
-static constexpr int TOTAL_STEPS = 2;  // training steps — arbitrary
+static constexpr int TOTAL_STEPS = 2; // training steps — arbitrary
 
 // ── Globals required by PegasusRunTime (defined in pegasus_runtime.cc) ──
 extern std::string save_model_loc;

@@ -33,3 +33,24 @@ target_link_libraries(softmax_test_exe pegasus)
 
 add_executable(test_update_iso_exe test_update_isolated.cc)
 target_link_libraries(test_update_iso_exe pegasus)
+
+add_executable(model_b_bc_exe model_b_breast_cancer.cpp)
+target_link_libraries(model_b_bc_exe pegasus)
+
+add_executable(model_b_bc_4l_exe model_b_bc_4layer.cpp)
+target_link_libraries(model_b_bc_4l_exe pegasus)
+
+add_executable(model_b_par_exe model_b_bc_parallel.cpp)
+target_link_libraries(model_b_par_exe pegasus)
+target_compile_options(model_b_par_exe PRIVATE -pthread)
+target_link_options(model_b_par_exe PRIVATE -pthread)
+
+add_executable(model_b_pipe_exe model_b_bc_pipeline.cpp)
+target_link_libraries(model_b_pipe_exe pegasus)
+target_compile_options(model_b_pipe_exe PRIVATE -pthread)
+target_link_options(model_b_pipe_exe PRIVATE -pthread)
+
+add_executable(model_b_dual_rt_exe model_b_bc_dual_rt.cpp)
+target_link_libraries(model_b_dual_rt_exe pegasus)
+target_compile_options(model_b_dual_rt_exe PRIVATE -pthread)
+target_link_options(model_b_dual_rt_exe PRIVATE -pthread)
