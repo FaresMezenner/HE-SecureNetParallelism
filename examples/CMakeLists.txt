@@ -21,3 +21,15 @@ target_link_libraries(model_c_exe pegasus)
 
 add_executable(model_d_exe model_d.cpp)
 target_link_libraries(model_d_exe pegasus)
+
+add_executable(l2r_test_exe l2r_test.cpp)
+target_link_libraries(l2r_test_exe pegasus)
+
+add_executable(pbs_test_exe pbs_test.cpp)
+target_link_libraries(pbs_test_exe pegasus)
+
+add_executable(softmax_test_exe softmax_test.cpp)
+target_link_libraries(softmax_test_exe pegasus)
+
+add_executable(test_update_iso_exe test_update_isolated.cc)
+target_link_libraries(test_update_iso_exe pegasus)

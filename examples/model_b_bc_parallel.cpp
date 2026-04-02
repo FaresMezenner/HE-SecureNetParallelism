@@ -1,0 +1,817 @@
+/*
+ * model_b_bc_parallel.cpp
+ * =======================
+ * Pipeline-parallel HE training: 4-layer MLP on Breast-Cancer dataset
+ * using PEGASUS hybrid CKKS+FHEW (HE-SecureNet).
+ *
+ * Architecture:  30 → 22 (ReLU) → 22 (ReLU) → 22 (ReLU) → 1 (Sigmoid)
+ *   + Local Classifier A:  22 → 1 (Sigmoid)   [branches off Layer 1 output]
+ *
+ * Module A  =  L1 forward  +  Local Classifier AL  +  L1 DReLU  +  L1/AL backprop+update
+ * Module B  =  L2→L3→L4 forward  +  L4→L3→L2 backprop+update
+ *
+ * Pipeline design (pipelined across steps):
+ *   Thread A (own step loop): L1 fwd → signal D1 → AL fwd + L1 DReLU + BP + W1/W_AL update
+ *   Thread B (own step loop): wait D1 → L2-L4 fwd + L4-L2 BP + W2/W3/W4 update
+ *   ONLY sync: Thread B waits for Thread A's D1 output per step.
+ *   Thread A NEVER waits for Thread B — starts next step immediately.
+ *
+ * ONE shared PegasusRunTime, two std::threads with independent step loops.
+ * Each thread calls omp_set_num_threads(12) — 12 OMP threads per module.
+ * SEAL operations are thread-safe for independent ciphertexts on the same context.
+ * MemoryManager::GetMMProf() patched to use thread_local (was static global).
+ * Timing globals in pegasus_runtime.cc are thread_local (no data races).
+ *
+ * Threads:  12 per module (half machine)
+ * Steps:    2  (epoch 0 + epoch 1)
+ * Batch:    full dataset packed in nslots=512
+ *
+ * CSV logging for Gantt diagram reconstruction with wall-clock timestamps.
+ */
+
+#include <cmath>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <functional>
+#include <iomanip>
+#include <sys/stat.h>
+
+#include "pegasus/pegasus_runtime.h"
+#include "pegasus/timer.h"
+
+using namespace std;
+using namespace gemini;
+
+// ── Tuneable constants ──────────────────────────────────────────────
+static constexpr int NUM_THREADS = 12; // per module (half machine = 12 cores)
+static constexpr int TOTAL_STEPS = 2;  // training steps
+
+// ── Globals required by PegasusRunTime (defined in pegasus_runtime.cc) ──
+extern std::string save_model_loc;
+extern std::string model_name;
+extern thread_local bool not_first_epoch;
+extern thread_local double total_save_model_time;
+extern thread_local double total_load_model_time;
+extern thread_local double total_offline_time;
+extern thread_local double total_online_time;
+
+// =====================================================================
+//  UTILITIES
+// =====================================================================
+static double get_rss_gb()
+{
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line))
+        if (line.rfind("VmRSS:", 0) == 0)
+        {
+            long kb = 0;
+            sscanf(line.c_str(), "VmRSS: %ld kB", &kb);
+            return kb / 1048576.0;
+        }
+    return -1.0;
+}
+
+static void mkdirs(const std::string &path)
+{
+    std::string partial;
+    for (char c : path)
+    {
+        partial += c;
+        if (c == '/')
+            mkdir(partial.c_str(), 0755);
+    }
+    if (!partial.empty())
+        mkdir(partial.c_str(), 0755);
+}
+
+static inline double pt_relu(double x) { return x > 0.0 ? x : 0.0; }
+static inline double pt_sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+
+// =====================================================================
+//  THREAD-SAFE TEXT LOGGER
+// =====================================================================
+struct TSLogger
+{
+    std::mutex mtx;
+    std::ofstream logfile;
+
+    void log(const std::string &tag, const std::string &msg)
+    {
+        time_t now = time(nullptr);
+        char ts[32];
+        strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
+        std::string line = std::string("[") + ts + "][" + tag + "] " + msg;
+        std::lock_guard<std::mutex> lk(mtx);
+        std::cout << line << std::endl;
+        if (logfile.is_open())
+            logfile << line << std::endl;
+    }
+
+    void log_time_mem(const std::string &tag, const std::string &label,
+                      double secs)
+    {
+        char buf[300];
+        snprintf(buf, sizeof(buf), "%-44s %10.1f s | RSS %.1f GB",
+                 label.c_str(), secs, get_rss_gb());
+        log(tag, buf);
+    }
+};
+
+// =====================================================================
+//  CSV OPERATION RECORDER (thread-safe)
+// =====================================================================
+using clk = std::chrono::steady_clock;
+
+struct OpRecord
+{
+    std::string thread;    // "main", "A", "B"
+    std::string module;    // "A", "B", "MAIN"
+    std::string operation; // e.g. "dense", "ReLU", "DReLU", "update" ...
+    int layer;
+    int step;
+    std::string phase;     // "FF", "BP", "UPDATE", "EVAL", "SETUP"
+    std::string par_group; // "SEQ_L1_s0", "PAR_A_s0", "PAR_B_s0", "EVAL_s0"
+    double start_s;
+    double end_s;
+    double duration_s;
+    double rss_gb;
+};
+
+struct CSVRecorder
+{
+    std::mutex mtx;
+    std::vector<OpRecord> records;
+    clk::time_point t0;
+
+    CSVRecorder() : t0(clk::now()) {}
+
+    double now_s() const
+    {
+        return std::chrono::duration<double>(clk::now() - t0).count();
+    }
+
+    void add(const OpRecord &r)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        records.push_back(r);
+    }
+
+    void write(const std::string &path)
+    {
+        std::ofstream f(path);
+        f << "thread,module,operation,layer,step,phase,parallel_group,"
+             "start_s,end_s,duration_s,rss_gb\n";
+        for (auto &r : records)
+            f << r.thread << "," << r.module << "," << r.operation << ","
+              << r.layer << "," << r.step << "," << r.phase << ","
+              << r.par_group << ","
+              << std::fixed << std::setprecision(1)
+              << r.start_s << "," << r.end_s << ","
+              << r.duration_s << "," << std::setprecision(2)
+              << r.rss_gb << "\n";
+    }
+};
+
+// ── Helper: execute + time + record an HE operation ─────────────────
+static void timed_op(CSVRecorder &csv, TSLogger &tlog,
+                     const std::string &thr, const std::string &mod,
+                     const std::string &op, int layer, int step,
+                     const std::string &phase, const std::string &pg,
+                     std::function<void()> fn)
+{
+    double t_start = csv.now_s();
+    tlog.log(thr, ">> " + op + " L" + std::to_string(layer));
+
+    fn(); // ← the actual HE operation
+
+    double t_end = csv.now_s();
+    double dur = t_end - t_start;
+    double rss = get_rss_gb();
+
+    tlog.log_time_mem(thr, "   " + op + " L" + std::to_string(layer), dur);
+    csv.add({thr, mod, op, layer, step, phase, pg,
+             t_start, t_end, dur, rss});
+}
+
+// =====================================================================
+//                             MAIN
+// =====================================================================
+int main(int /*argc*/, char * /*argv*/[])
+{
+    // ── Open log file ───────────────────────────────────────────────
+    std::string log_dir = "./logs";
+    mkdirs(log_dir);
+    TSLogger tlog;
+    {
+        time_t now = time(nullptr);
+        char buf[64];
+        strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&now));
+        std::string log_path = log_dir + "/model_b_par_" + std::string(buf) + ".log";
+        tlog.logfile.open(log_path, std::ios::out);
+        tlog.log("MAIN", "Log file: " + log_path);
+    }
+
+    CSVRecorder csv;
+    tlog.log("MAIN", "=== Pipeline-parallel experiment ===");
+    tlog.log("MAIN", "REAL parallelism via std::thread — NOT sequential simulation");
+    tlog.log("MAIN", "Threads per module: " + std::to_string(NUM_THREADS));
+    tlog.log("MAIN", "Total steps: " + std::to_string(TOTAL_STEPS));
+
+    // ── Pegasus parameter setup ─────────────────────────────────────
+    PegasusRunTime::Parms pp;
+    pp.lvl0_lattice_dim = lwe::params::n(); // 1024
+    pp.lvl1_lattice_dim = 1 << 12;          // 4096
+    pp.lvl2_lattice_dim = 1 << 16;          // 65536
+    pp.nlevels = 8;
+    pp.scale = std::pow(2., 40);
+    pp.nslots = 512;
+    pp.s2c_multiplier = 1.;
+    pp.enable_repacking = true;
+
+    tlog.log("MAIN", "Creating PegasusRunTime (N=65536, nslots=512, nlevels=8, threads=" + std::to_string(NUM_THREADS) + ") ...");
+    tlog.log("MAIN", "Arch: 30->22(ReLU)->22(ReLU)->22(ReLU)->1(Sigmoid) + LocalClf 22->1(Sigmoid)");
+
+    double setup_start = csv.now_s();
+    PegasusRunTime pg_rt(pp, NUM_THREADS);
+    omp_set_num_threads(NUM_THREADS);
+    double setup_end = csv.now_s();
+    tlog.log_time_mem("MAIN", "SETUP (keygen + context)", setup_end - setup_start);
+    csv.add({"main", "MAIN", "setup", 0, -1, "SETUP", "SETUP",
+             setup_start, setup_end, setup_end - setup_start, get_rss_gb()});
+
+    // ── Model save location ─────────────────────────────────────────
+    save_model_loc = "./model/model_b_par/";
+    model_name = "par";
+    mkdirs(save_model_loc);
+    tlog.log("MAIN", "Checkpoint dir: " + save_model_loc);
+
+    // ── Network dimensions ──────────────────────────────────────────
+    const int l0 = 30; // input
+    const int l1 = 22; // hidden 1
+    const int l2 = 22; // hidden 2
+    const int l3 = 22; // hidden 3
+    const int l4 = 1;  // output
+    const int lAL = 1; // local classifier output
+    const int nslots = pp.nslots;
+    const int n_train = 455;
+    const int n_test = 114;
+
+    not_first_epoch = false;
+
+    // ── Read Breast-Cancer dataset ──────────────────────────────────
+    tlog.log("MAIN", "Reading Breast Cancer dataset ...");
+    vector<vector<F64>> x_train(l0, vector<F64>(nslots, 0.0));
+    vector<vector<F64>> x_test(l0, vector<F64>(nslots, 0.0));
+    vector<F64> y_train_raw(nslots, 0.0);
+    vector<F64> y_test_raw(nslots, 0.0);
+
+    {
+        ifstream fin("../dataset/breast_cancer/x_train.out");
+        if (!fin.is_open())
+        {
+            tlog.log("MAIN", "ERROR: cannot open x_train.out");
+            return 1;
+        }
+        for (int j = 0; j < n_train; ++j)
+            for (int i = 0; i < l0; ++i)
+                fin >> x_train[i][j];
+    }
+    {
+        ifstream fin("../dataset/breast_cancer/x_test.out");
+        if (!fin.is_open())
+        {
+            tlog.log("MAIN", "ERROR: cannot open x_test.out");
+            return 1;
+        }
+        for (int j = 0; j < n_test; ++j)
+            for (int i = 0; i < l0; ++i)
+                fin >> x_test[i][j];
+    }
+    {
+        ifstream fin("../dataset/breast_cancer/y_train.out");
+        if (!fin.is_open())
+        {
+            tlog.log("MAIN", "ERROR: cannot open y_train.out");
+            return 1;
+        }
+        for (int j = 0; j < n_train; ++j)
+            fin >> y_train_raw[j];
+    }
+    {
+        ifstream fin("../dataset/breast_cancer/y_test.out");
+        if (!fin.is_open())
+        {
+            tlog.log("MAIN", "ERROR: cannot open y_test.out");
+            return 1;
+        }
+        for (int j = 0; j < n_test; ++j)
+            fin >> y_test_raw[j];
+    }
+    tlog.log("MAIN", "Dataset loaded: train=" + to_string(n_train) + " test=" + to_string(n_test) + " features=" + to_string(l0));
+
+    // ── Cipher-domain vectors ───────────────────────────────────────
+    // Shared / L1 (used in sequential phase)
+    vector<vector<F64>> D0_plain(l0, vector<F64>(nslots, 0.0));
+    vector<Ctx> D0_cipher(l0);
+    vector<Ctx> U1_cipher(l1);
+    vector<Ctx> D1_cipher(l1);   // Module A keeps original
+    vector<Ctx> D1_buffer_0(l1); // Double-buffered D1 for pipeline (even steps)
+    vector<Ctx> D1_buffer_1(l1); // Double-buffered D1 for pipeline (odd steps)
+
+    // Labels
+    vector<vector<F64>> Y(l4, vector<F64>(nslots, 0.0));
+    vector<Ctx> Y_cipher(l4);
+
+    // ── Weights ─────────────────────────────────────────────────────
+    vector<vector<F64>> W1(l0, vector<F64>(l1, 0.0));
+    vector<F64> B1(l1, 0.0);
+
+    // Local Classifier AL (22→1)
+    vector<vector<F64>> W_AL(l1, vector<F64>(lAL, 0.0));
+    vector<F64> B_AL(lAL, 0.0);
+
+    // Module B weights
+    vector<vector<F64>> W2(l1, vector<F64>(l2, 0.0));
+    vector<F64> B2(l2, 0.0);
+    vector<vector<F64>> W3(l2, vector<F64>(l3, 0.0));
+    vector<F64> B3(l3, 0.0);
+    vector<vector<F64>> W4(l3, vector<F64>(l4, 0.0));
+    vector<F64> B4(l4, 0.0);
+
+    // ── Module A intermediates ──────────────────────────────────────
+    vector<Ctx> U_AL_cipher(lAL);
+    vector<Ctx> D_AL_cipher(lAL);
+    vector<Ctx> DE_AL_cipher(lAL);
+    vector<Ctx> U1_deriv_cipher(l1); // DReLU(L1) output
+    vector<Ctx> DE1_cipher(l1);
+
+    // ── Module B intermediates ──────────────────────────────────────
+    vector<Ctx> U2_cipher(l2), D2_cipher(l2), DE2_cipher(l2);
+    vector<Ctx> U3_cipher(l3), D3_cipher(l3), DE3_cipher(l3);
+    vector<Ctx> U4_cipher(l4), D4_cipher(l4), DE4_cipher(l4);
+    vector<Ctx> U2_deriv_cipher(l2); // DReLU(L2) output
+    vector<Ctx> U3_deriv_cipher(l3); // DReLU(L3) output
+
+    // ── LWE buffers (SEPARATE per module to avoid data races) ───────
+    const int max_dim = std::max({l1, l2, l3, l4, lAL});
+
+    // Module A scratch
+    vector<vector<lwe::Ctx_st>> U_lwe_a(max_dim, vector<lwe::Ctx_st>(nslots));
+    vector<vector<lwe::Ctx_st>> D_lwe_a(max_dim, vector<lwe::Ctx_st>(nslots));
+    // Saved S2C output for deferred L1 DReLU
+    vector<vector<lwe::Ctx_st>> L1_lwe_saved(l1, vector<lwe::Ctx_st>(nslots));
+
+    // Module B scratch
+    vector<vector<lwe::Ctx_st>> U_lwe_b(max_dim, vector<lwe::Ctx_st>(nslots));
+    vector<vector<lwe::Ctx_st>> D_lwe_b(max_dim, vector<lwe::Ctx_st>(nslots));
+    // Saved S2C output for deferred L2/L3 DReLU
+    vector<vector<lwe::Ctx_st>> L2_lwe_saved(l2, vector<lwe::Ctx_st>(nslots));
+    vector<vector<lwe::Ctx_st>> L3_lwe_saved(l3, vector<lwe::Ctx_st>(nslots));
+
+    // ── Initialise weights (Xavier-like, ±0.3) ─────────────────────
+    tlog.log("MAIN", "Initialising weights ...");
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<double> dis(-0.3, 0.3);
+
+    for (int i = 0; i < l0; ++i)
+        for (int j = 0; j < l1; ++j)
+            W1[i][j] = dis(gen);
+    for (int j = 0; j < l1; ++j)
+        B1[j] = dis(gen);
+
+    for (int i = 0; i < l1; ++i)
+        for (int j = 0; j < lAL; ++j)
+            W_AL[i][j] = dis(gen);
+    for (int j = 0; j < lAL; ++j)
+        B_AL[j] = dis(gen);
+
+    for (int i = 0; i < l1; ++i)
+        for (int j = 0; j < l2; ++j)
+            W2[i][j] = dis(gen);
+    for (int j = 0; j < l2; ++j)
+        B2[j] = dis(gen);
+    for (int i = 0; i < l2; ++i)
+        for (int j = 0; j < l3; ++j)
+            W3[i][j] = dis(gen);
+    for (int j = 0; j < l3; ++j)
+        B3[j] = dis(gen);
+    for (int i = 0; i < l3; ++i)
+        for (int j = 0; j < l4; ++j)
+            W4[i][j] = dis(gen);
+    for (int j = 0; j < l4; ++j)
+        B4[j] = dis(gen);
+
+    // ── Encrypt inputs (once) ───────────────────────────────────────
+    tlog.log("MAIN", "Encrypting D0 (30 cts) ...");
+    {
+        double t = 0.0;
+        AutoTimer timer(&t);
+        for (int i = 0; i < l0; ++i)
+            D0_plain[i] = x_train[i];
+#pragma omp parallel for
+        for (int i = 0; i < l0; ++i)
+            CHECK_AND_ABORT(pg_rt.EncodeThenEncrypt(D0_plain[i], D0_cipher[i]));
+        timer.stop();
+        tlog.log_time_mem("MAIN", "ENCRYPT D0", t);
+    }
+
+    // ── Encrypt labels (once, with S2C+repack refresh) ──────────────
+    tlog.log("MAIN", "Encrypting Y (1 ct) ...");
+    {
+        double t = 0.0;
+        AutoTimer timer(&t);
+        for (int j = 0; j < nslots; ++j)
+            Y[0][j] = y_train_raw[j];
+        for (int i = 0; i < l4; ++i)
+            CHECK_AND_ABORT(pg_rt.EncodeThenEncrypt(Y[i], Y_cipher[i]));
+
+        // Refresh levels via S2C → extract → repack (using Module A's LWE scratch)
+        pg_rt.s2c_and_extract(Y_cipher, U_lwe_a, l4, nslots);
+        pg_rt.repack(U_lwe_a, Y_cipher, l4, nslots);
+        timer.stop();
+        tlog.log_time_mem("MAIN", "ENCRYPT Y + refresh", t);
+    }
+
+    tlog.log("MAIN", "Peak RSS after setup: " + to_string(get_rss_gb()) + " GB");
+
+    // ==================================================================
+    //                  TRAINING LOOP  (pipeline-parallel)
+    // ==================================================================
+    // Thread A: independent step loop — L1 forward + local clf + backprop
+    // Thread B: independent step loop — waits for D1 → L2-L4 fwd + BP
+    // Sync point: condition variable on D1 buffer readiness (only dependency)
+    // Double-buffered D1: buf_0 for even steps, buf_1 for odd steps
+    // NOTE: For TOTAL_STEPS > 2, add a consumption counter to prevent
+    //       Thread A from overwriting a buffer Thread B is still reading.
+    static_assert(TOTAL_STEPS <= 2,
+                  "Double-buffer pipeline safe for TOTAL_STEPS <= 2; "
+                  "add consumption barrier for more steps.");
+
+    std::mutex d1_mtx;
+    std::condition_variable d1_cv;
+    int d1_ready_step = -1; // Thread A signals: "D1 for step X is ready"
+
+    tlog.log("MAIN", "Launching pipeline — Thread A & B with independent step loops");
+    tlog.log("MAIN", "Total steps: " + std::to_string(TOTAL_STEPS));
+    double pipeline_start = csv.now_s();
+
+    // ══════════════════════════════════════════════════════════════════
+    //  THREAD A: L1 forward + Module A (local clf + L1 backprop)
+    //            Runs its OWN step loop — NEVER waits for Thread B
+    // ══════════════════════════════════════════════════════════════════
+    std::thread thread_a([&]()
+                         {
+        omp_set_num_threads(NUM_THREADS);
+        not_first_epoch = false; // thread_local: Thread A's own copy
+
+        for (int step = 0; step < TOTAL_STEPS; ++step)
+        {
+            int epoch = step;
+            if (step > 0) not_first_epoch = true;
+
+            std::string pg_l1 = "L1_A_s" + to_string(step);
+            std::string pg_a  = "PAR_A_s" + to_string(step);
+
+            tlog.log("A", "=========== STEP " + to_string(step) + " ===========");
+            double step_start = csv.now_s();
+
+            // ─── L1 Forward (no barrier — Thread A owns this) ────────
+            timed_op(csv, tlog, "A", "A", "dense", 1, step, "FF", pg_l1, [&]
+                     { pg_rt.dense(pp, D0_cipher, W1, B1, U1_cipher, 1, epoch); });
+
+            timed_op(csv, tlog, "A", "A", "s2c_extract", 1, step, "FF", pg_l1, [&]
+                     { pg_rt.s2c_and_extract(U1_cipher, U_lwe_a, l1, nslots); });
+
+            timed_op(csv, tlog, "A", "A", "save_lwe", 1, step, "FF", pg_l1, [&]
+                     {
+                         for (int i = 0; i < l1; ++i)
+                             L1_lwe_saved[i] = U_lwe_a[i];
+                     });
+
+            timed_op(csv, tlog, "A", "A", "ReLU", 1, step, "FF", pg_l1, [&]
+                     { pg_rt.act_batch(U_lwe_a, D_lwe_a, D1_cipher, l1, nslots, "ReLU"); });
+
+            // ─── Copy D1 → double buffer + SIGNAL Thread B ──────────
+            auto& D1_buf = (step % 2 == 0) ? D1_buffer_0 : D1_buffer_1;
+            timed_op(csv, tlog, "A", "A", "copy_D1_buffer", 1, step, "FF", pg_l1, [&]
+                     {
+                         for (int i = 0; i < l1; ++i)
+                             D1_buf[i] = D1_cipher[i];
+                     });
+            {
+                std::lock_guard<std::mutex> lk(d1_mtx);
+                d1_ready_step = step;
+            }
+            d1_cv.notify_one();
+            tlog.log("A", "D1 buffer ready -> signaled step " + to_string(step));
+
+            // ─── AL Forward: dense(22→1) → S2C → Sigmoid ────────────
+            timed_op(csv, tlog, "A", "A", "dense", 10, step, "FF", pg_a, [&]
+                     { pg_rt.dense(pp, D1_cipher, W_AL, B_AL, U_AL_cipher, 10, epoch); });
+
+            timed_op(csv, tlog, "A", "A", "s2c_extract", 10, step, "FF", pg_a, [&]
+                     { pg_rt.s2c_and_extract(U_AL_cipher, U_lwe_a, lAL, nslots); });
+
+            timed_op(csv, tlog, "A", "A", "Sigmoid", 10, step, "FF", pg_a, [&]
+                     { pg_rt.act_batch(U_lwe_a, D_lwe_a, D_AL_cipher, lAL, nslots, "Sigmoid"); });
+
+            // ─── AL Delta:  DE_AL = D_AL − Y ────────────────────────
+            timed_op(csv, tlog, "A", "A", "delta_softmax", 10, step, "BP", pg_a, [&]
+                     { pg_rt.delta_softmax(pp, D_AL_cipher, Y_cipher, DE_AL_cipher); });
+
+            // ─── L1 DReLU (deferred, from saved LWE) ────────────────
+            timed_op(csv, tlog, "A", "A", "DReLU", 1, step, "BP", pg_a, [&]
+                     { pg_rt.act_batch(L1_lwe_saved, D_lwe_a, U1_deriv_cipher, l1, nslots, "DReLU"); });
+
+            // ─── L1 Delta:  DE1 = (W_AL^T · DE_AL) ⊙ DReLU(U1) ─────
+            timed_op(csv, tlog, "A", "A", "delta_1D_dense_1D", 1, step, "BP", pg_a, [&]
+                     { pg_rt.delta_1D_dense_1D(pp, W_AL, DE_AL_cipher, U1_deriv_cipher,
+                                               DE1_cipher, 10, epoch); });
+
+            // ─── L1 S2C+Repack (refresh levels for weight update) ────
+            timed_op(csv, tlog, "A", "A", "s2c_repack_1D", 1, step, "BP", pg_a, [&]
+                     { pg_rt.s2c_repack_1D(DE1_cipher, U_lwe_a, nslots); });
+
+            // ─── Weight Updates ──────────────────────────────────────
+            timed_op(csv, tlog, "A", "A", "update_W_AL", 10, step, "UPDATE", pg_a, [&]
+                     { pg_rt.update_model_dense(pp, D1_cipher, DE_AL_cipher,
+                                                W_AL, B_AL, 5, 10, epoch); });
+
+            timed_op(csv, tlog, "A", "A", "update_W1", 1, step, "UPDATE", pg_a, [&]
+                     { pg_rt.update_model_dense(pp, D0_cipher, DE1_cipher,
+                                                W1, B1, 5, 1, epoch); });
+
+            double step_end = csv.now_s();
+            double step_dur = step_end - step_start;
+            tlog.log_time_mem("A", "Thread A STEP " + to_string(step) + " TOTAL", step_dur);
+            csv.add({"A", "A", "step_total_A", 0, step, "STEP", "STEP_A_s" + to_string(step),
+                     step_start, step_end, step_dur, get_rss_gb()});
+
+            // ─── Local Classifier eval (plaintext, Thread A exclusive) ─
+            {
+                int correct = 0;
+                for (int k = 0; k < n_test; ++k)
+                {
+                    vector<double> h1(l1, 0.0);
+                    for (int j = 0; j < l1; ++j)
+                    {
+                        double sum = B1[j];
+                        for (int i = 0; i < l0; ++i)
+                            sum += x_test[i][k] * W1[i][j];
+                        h1[j] = pt_relu(sum);
+                    }
+                    double out_al = B_AL[0];
+                    for (int i = 0; i < l1; ++i)
+                        out_al += h1[i] * W_AL[i][0];
+                    double pred_al = pt_sigmoid(out_al);
+                    if (((pred_al >= 0.5) ? 1.0 : 0.0) == y_test_raw[k])
+                        ++correct;
+                }
+                double acc = 1.0 * correct / n_test;
+                tlog.log("A", "[LOCAL CLF A] Step " + to_string(step) + " Accuracy: "
+                         + to_string(acc) + " (" + to_string(correct) + "/" + to_string(n_test) + ")");
+                csv.add({"A", "A", "eval_local", 0, step, "EVAL", "EVAL_A_s" + to_string(step),
+                         csv.now_s(), csv.now_s(), 0.0, get_rss_gb()});
+            }
+        }
+        tlog.log("A", "Thread A FINISHED all steps | RSS " + to_string(get_rss_gb()) + " GB"); }); // end thread_a
+
+    // ══════════════════════════════════════════════════════════════════
+    //  THREAD B: Module B — L2→L3→L4 forward + backward + updates
+    //            Waits ONLY for D1 signal per step, otherwise independent
+    // ══════════════════════════════════════════════════════════════════
+    std::thread thread_b([&]()
+                         {
+        omp_set_num_threads(NUM_THREADS);
+        not_first_epoch = false; // thread_local: Thread B's own copy
+
+        for (int step = 0; step < TOTAL_STEPS; ++step)
+        {
+            int epoch = step;
+            if (step > 0) not_first_epoch = true;
+
+            std::string pg_b = "PAR_B_s" + to_string(step);
+
+            // ─── Wait for Thread A to produce D1 for this step ───────
+            {
+                std::unique_lock<std::mutex> lk(d1_mtx);
+                d1_cv.wait(lk, [&]{ return d1_ready_step >= step; });
+            }
+            auto& D1_buf = (step % 2 == 0) ? D1_buffer_0 : D1_buffer_1;
+
+            tlog.log("B", "=========== STEP " + to_string(step) + " (D1 received) ===========");
+            double step_start = csv.now_s();
+
+            // ─── L2 Forward ──────────────────────────────────────────
+            timed_op(csv, tlog, "B", "B", "dense", 2, step, "FF", pg_b, [&]
+                     { pg_rt.dense(pp, D1_buf, W2, B2, U2_cipher, 2, epoch); });
+
+            timed_op(csv, tlog, "B", "B", "s2c_extract", 2, step, "FF", pg_b, [&]
+                     { pg_rt.s2c_and_extract(U2_cipher, U_lwe_b, l2, nslots); });
+
+            timed_op(csv, tlog, "B", "B", "save_lwe", 2, step, "FF", pg_b, [&]
+                     {
+                         for (int i = 0; i < l2; ++i)
+                             L2_lwe_saved[i] = U_lwe_b[i];
+                     });
+
+            timed_op(csv, tlog, "B", "B", "ReLU", 2, step, "FF", pg_b, [&]
+                     { pg_rt.act_batch(U_lwe_b, D_lwe_b, D2_cipher, l2, nslots, "ReLU"); });
+
+            // ─── L3 Forward ──────────────────────────────────────────
+            timed_op(csv, tlog, "B", "B", "dense", 3, step, "FF", pg_b, [&]
+                     { pg_rt.dense(pp, D2_cipher, W3, B3, U3_cipher, 3, epoch); });
+
+            timed_op(csv, tlog, "B", "B", "s2c_extract", 3, step, "FF", pg_b, [&]
+                     { pg_rt.s2c_and_extract(U3_cipher, U_lwe_b, l3, nslots); });
+
+            timed_op(csv, tlog, "B", "B", "save_lwe", 3, step, "FF", pg_b, [&]
+                     {
+                         for (int i = 0; i < l3; ++i)
+                             L3_lwe_saved[i] = U_lwe_b[i];
+                     });
+
+            timed_op(csv, tlog, "B", "B", "ReLU", 3, step, "FF", pg_b, [&]
+                     { pg_rt.act_batch(U_lwe_b, D_lwe_b, D3_cipher, l3, nslots, "ReLU"); });
+
+            // ─── L4 Forward ──────────────────────────────────────────
+            timed_op(csv, tlog, "B", "B", "dense", 4, step, "FF", pg_b, [&]
+                     { pg_rt.dense(pp, D3_cipher, W4, B4, U4_cipher, 4, epoch); });
+
+            timed_op(csv, tlog, "B", "B", "s2c_extract", 4, step, "FF", pg_b, [&]
+                     { pg_rt.s2c_and_extract(U4_cipher, U_lwe_b, l4, nslots); });
+
+            timed_op(csv, tlog, "B", "B", "Sigmoid", 4, step, "FF", pg_b, [&]
+                     { pg_rt.act_batch(U_lwe_b, D_lwe_b, D4_cipher, l4, nslots, "Sigmoid"); });
+
+            // ─── L4 Delta:  DE4 = D4 − Y ────────────────────────────
+            timed_op(csv, tlog, "B", "B", "delta_softmax", 4, step, "BP", pg_b, [&]
+                     { pg_rt.delta_softmax(pp, D4_cipher, Y_cipher, DE4_cipher); });
+
+            // ─── L3 DReLU (deferred, from saved L3 LWE) ─────────────
+            timed_op(csv, tlog, "B", "B", "DReLU", 3, step, "BP", pg_b, [&]
+                     { pg_rt.act_batch(L3_lwe_saved, D_lwe_b, U3_deriv_cipher, l3, nslots, "DReLU"); });
+
+            // ─── L3 Delta ────────────────────────────────────────────
+            timed_op(csv, tlog, "B", "B", "delta_1D_dense_1D", 3, step, "BP", pg_b, [&]
+                     { pg_rt.delta_1D_dense_1D(pp, W4, DE4_cipher, U3_deriv_cipher,
+                                               DE3_cipher, 4, epoch); });
+
+            timed_op(csv, tlog, "B", "B", "s2c_repack_1D", 3, step, "BP", pg_b, [&]
+                     { pg_rt.s2c_repack_1D(DE3_cipher, U_lwe_b, nslots); });
+
+            // ─── L2 DReLU (deferred, from saved L2 LWE) ─────────────
+            timed_op(csv, tlog, "B", "B", "DReLU", 2, step, "BP", pg_b, [&]
+                     { pg_rt.act_batch(L2_lwe_saved, D_lwe_b, U2_deriv_cipher, l2, nslots, "DReLU"); });
+
+            // ─── L2 Delta ────────────────────────────────────────────
+            timed_op(csv, tlog, "B", "B", "delta_1D_dense_1D", 2, step, "BP", pg_b, [&]
+                     { pg_rt.delta_1D_dense_1D(pp, W3, DE3_cipher, U2_deriv_cipher,
+                                               DE2_cipher, 3, epoch); });
+
+            timed_op(csv, tlog, "B", "B", "s2c_repack_1D", 2, step, "BP", pg_b, [&]
+                     { pg_rt.s2c_repack_1D(DE2_cipher, U_lwe_b, nslots); });
+
+            // ─── Weight Updates (L4, L3, L2) ─────────────────────────
+            timed_op(csv, tlog, "B", "B", "update_W4", 4, step, "UPDATE", pg_b, [&]
+                     { pg_rt.update_model_dense(pp, D3_cipher, DE4_cipher,
+                                                W4, B4, 5, 4, epoch); });
+
+            timed_op(csv, tlog, "B", "B", "update_W3", 3, step, "UPDATE", pg_b, [&]
+                     { pg_rt.update_model_dense(pp, D2_cipher, DE3_cipher,
+                                                W3, B3, 5, 3, epoch); });
+
+            timed_op(csv, tlog, "B", "B", "update_W2", 2, step, "UPDATE", pg_b, [&]
+                     { pg_rt.update_model_dense(pp, D1_buf, DE2_cipher,
+                                                W2, B2, 5, 2, epoch); });
+
+            double step_end = csv.now_s();
+            double step_dur = step_end - step_start;
+            tlog.log_time_mem("B", "Thread B STEP " + to_string(step) + " TOTAL", step_dur);
+            csv.add({"B", "B", "step_total_B", 0, step, "STEP", "STEP_B_s" + to_string(step),
+                     step_start, step_end, step_dur, get_rss_gb()});
+        }
+        tlog.log("B", "Thread B FINISHED all steps | RSS " + to_string(get_rss_gb()) + " GB"); }); // end thread_b
+
+    // ── Wait for BOTH threads to complete ALL steps ─────────────────
+    tlog.log("MAIN", "Pipeline running — waiting for both threads ...");
+    thread_a.join();
+    tlog.log("MAIN", "Thread A joined");
+    thread_b.join();
+    tlog.log("MAIN", "Thread B joined");
+
+    double pipeline_end = csv.now_s();
+    double pipeline_dur = pipeline_end - pipeline_start;
+    tlog.log_time_mem("MAIN", "PIPELINE TOTAL (all steps)", pipeline_dur);
+    csv.add({"main", "MAIN", "pipeline_total", 0, TOTAL_STEPS - 1, "STEP", "PIPELINE",
+             pipeline_start, pipeline_end, pipeline_dur, get_rss_gb()});
+
+    // ==================================================================
+    //  EVALUATION (plaintext, test set) — after ALL steps complete
+    // ==================================================================
+    tlog.log("MAIN", "--- FINAL EVALUATION (plaintext, test set) ---");
+
+    // Full model accuracy:  W1 → W2 → W3 → W4
+    {
+        int correct = 0;
+        for (int k = 0; k < n_test; ++k)
+        {
+            vector<double> h1(l1, 0.0);
+            for (int j = 0; j < l1; ++j)
+            {
+                double sum = B1[j];
+                for (int i = 0; i < l0; ++i)
+                    sum += x_test[i][k] * W1[i][j];
+                h1[j] = pt_relu(sum);
+            }
+            vector<double> h2(l2, 0.0);
+            for (int j = 0; j < l2; ++j)
+            {
+                double sum = B2[j];
+                for (int i = 0; i < l1; ++i)
+                    sum += h1[i] * W2[i][j];
+                h2[j] = pt_relu(sum);
+            }
+            vector<double> h3(l3, 0.0);
+            for (int j = 0; j < l3; ++j)
+            {
+                double sum = B3[j];
+                for (int i = 0; i < l2; ++i)
+                    sum += h2[i] * W3[i][j];
+                h3[j] = pt_relu(sum);
+            }
+            double out = B4[0];
+            for (int i = 0; i < l3; ++i)
+                out += h3[i] * W4[i][0];
+            double pred = pt_sigmoid(out);
+            if (((pred >= 0.5) ? 1.0 : 0.0) == y_test_raw[k])
+                ++correct;
+        }
+        double acc = 1.0 * correct / n_test;
+        tlog.log("MAIN", "[FULL MODEL] Final Accuracy: " + to_string(acc) + " (" + to_string(correct) + "/" + to_string(n_test) + ")");
+        csv.add({"main", "MAIN", "eval_full", 0, TOTAL_STEPS - 1, "EVAL", "EVAL_final",
+                 csv.now_s(), csv.now_s(), 0.0, get_rss_gb()});
+    }
+
+    // Local classifier accuracy:  W1 → W_AL
+    {
+        int correct = 0;
+        for (int k = 0; k < n_test; ++k)
+        {
+            vector<double> h1(l1, 0.0);
+            for (int j = 0; j < l1; ++j)
+            {
+                double sum = B1[j];
+                for (int i = 0; i < l0; ++i)
+                    sum += x_test[i][k] * W1[i][j];
+                h1[j] = pt_relu(sum);
+            }
+            double out_al = B_AL[0];
+            for (int i = 0; i < l1; ++i)
+                out_al += h1[i] * W_AL[i][0];
+            double pred_al = pt_sigmoid(out_al);
+            if (((pred_al >= 0.5) ? 1.0 : 0.0) == y_test_raw[k])
+                ++correct;
+        }
+        double acc = 1.0 * correct / n_test;
+        tlog.log("MAIN", "[LOCAL CLF A] Final Accuracy: " + to_string(acc) + " (" + to_string(correct) + "/" + to_string(n_test) + ")");
+        csv.add({"main", "A", "eval_local", 0, TOTAL_STEPS - 1, "EVAL", "EVAL_final",
+                 csv.now_s(), csv.now_s(), 0.0, get_rss_gb()});
+    }
+
+    // ==================================================================
+    //  FINAL SUMMARY
+    // ==================================================================
+    tlog.log("MAIN", "=========================================");
+    tlog.log("MAIN", "         TRAINING COMPLETE               ");
+    tlog.log("MAIN", "=========================================");
+    tlog.log("MAIN", "NOTE: Timing globals are thread_local — per-thread copies.");
+    tlog.log("MAIN", "Main-thread timing (setup only):");
+    tlog.log("MAIN", "  TOTAL SAVE MODEL TIME  " + to_string(total_save_model_time) + " s");
+    tlog.log("MAIN", "  TOTAL LOAD MODEL TIME  " + to_string(total_load_model_time) + " s");
+    tlog.log("MAIN", "  TOTAL OFFLINE TIME     " + to_string(total_offline_time) + " s");
+    tlog.log("MAIN", "  TOTAL ONLINE TIME      " + to_string(total_online_time) + " s");
+    tlog.log("MAIN", "Final RSS: " + to_string(get_rss_gb()) + " GB");
+
+    // Write CSV
+    std::string csv_path = "./logs/parallel_ops.csv";
+    csv.write(csv_path);
+    tlog.log("MAIN", "CSV written: " + csv_path);
+
+    if (tlog.logfile.is_open())
+        tlog.logfile.close();
+    return 0;
+}

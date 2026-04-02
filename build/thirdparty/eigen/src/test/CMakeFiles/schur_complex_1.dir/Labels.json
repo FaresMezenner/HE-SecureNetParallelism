@@ -1,0 +1,16 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/lf_mezenner_udst_edu_qa/secure-parallel-training/HE-SecureNet/thirdparty/eigen/src/test/schur_complex.cpp"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"BuildOfficial"
+		],
+		"name" : "schur_complex_1"
+	}
+}
